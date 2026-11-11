@@ -1,0 +1,81 @@
+name: Nextbell daily update
+
+on:
+  schedule:
+    # 22:30 UTC, Monday to Friday. US markets close at 21:00 UTC (winter) or 20:00 UTC (summer),
+    # so the data is final. In Ulaanbaatar this is 06:30 the next morning.
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: "Throw away the cached prices and download the full history again"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: nextbell-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Install packages
+        run: pip install -r pipeline/requirements.txt
+
+      # data/ holds the downloaded prices and the last backtest result.
+      # It is restored from the newest cache, so each day only the new bars are downloaded.
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: nextbell-data-${{ github.run_id }}
+          restore-keys: |
+            nextbell-data-
+
+      - name: Full refresh requested
+        if: ${{ inputs.full_refresh }}
+        run: rm -f data/prices.parquet data/market.parquet data/eval_cache.json
+
+      - name: Update prices, grade the model, predict the next session
+        run: python pipeline/run_all.py --daily
+
+      - name: Summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open("web/data/predictions.json"))
+          m, k = d["meta"], d["metrics"]
+          print(f"**As of {m['as_of']}**, {m['universe']:,} stocks, backtest recomputed {m.get('eval_computed')}")
+          print(f"\nOut-of-sample accuracy {k['accuracy']}% (always-up baseline {k['base_up']}%), AUC {k['auc']}")
+          PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
